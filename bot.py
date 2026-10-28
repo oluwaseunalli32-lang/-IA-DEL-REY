@@ -10,10 +10,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Educational Command Handlers ---
+# --- Educational Command Handlers (Keep these as they are) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a welcome message explaining the bot's purpose."""
     user = update.effective_user
     await update.message.reply_html(
         f"👋 Hello {user.mention_html()}!\n\n"
@@ -22,7 +21,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List available commands."""
     help_text = (
         "📚 **Available Commands:**\n"
         "/start - Welcome message\n"
@@ -33,16 +31,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Provide an educational AI fact or explanation."""
-    # In a real bot, you would rotate through a database of concepts.
     fact = (
         "💡 **AI Concept:** What is Machine Learning?\n\n"
-        "Machine Learning is a subset of AI that allows systems to learn and improve from experience without being explicitly programmed. It focuses on developing computer programs that can access data and use it to learn for themselves."
+        "Machine Learning is a subset of AI that allows systems to learn and improve from experience without being explicitly programmed."
     )
     await update.message.reply_text(fact, parse_mode='Markdown')
 
 async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a simple educational quiz question."""
     question = (
         "🧠 **Quick Quiz:**\n"
         "What does 'AI' stand for?\n\n"
@@ -53,18 +48,17 @@ async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(question, parse_mode='Markdown')
 
-# --- Main Application ---
+# --- Main Application (POLLING VERSION for Background Worker) ---
 
 def main() -> None:
-    """Start the bot in webhook mode for Render."""
-    # Get the token from Render's environment variables
+    """Start the bot in polling mode."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN environment variable not set!")
         return
 
-    # Build the application
-    application = ApplicationBuilder().token(token).updater(None).build()
+    # Build the application normally (polling is the default)
+    application = ApplicationBuilder().token(token).build()
 
     # Register command handlers
     application.add_handler(CommandHandler("start", start))
@@ -72,25 +66,9 @@ def main() -> None:
     application.add_handler(CommandHandler("learn", learn))
     application.add_handler(CommandHandler("quiz", quiz))
 
-    # --- Webhook Configuration for Render ---
-    # Render provides the PORT and the public URL (RENDER_EXTERNAL_URL)
-    port = int(os.environ.get("PORT", "8080"))
-    webhook_url = os.environ.get("RENDER_EXTERNAL_URL")
-    
-    if not webhook_url:
-        logger.error("RENDER_EXTERNAL_URL not set. This is required for webhooks on Render.")
-        return
-
-    full_webhook_url = f"{webhook_url}/webhook"
-    
-    # Start the webhook server
-    # Telegram will send updates to https://<your-service>.onrender.com/webhook
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path="webhook",
-        webhook_url=full_webhook_url,
-    )
+    logger.info("Bot is starting in polling mode...")
+    # run_polling() starts the bot and keeps it running indefinitely
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
