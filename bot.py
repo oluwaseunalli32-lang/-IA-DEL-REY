@@ -8,7 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(
@@ -27,7 +27,7 @@ SUBSCRIBERS_FILE = Path("subscribers.json")
 WELCOME_DELAY = 5      # wait before the "no blockage" message
 SECOND_DELAY = 2       # wait before deleting the welcome message
 DELETE_DELAY = 3       # wait before the promo message
-PROMO_SECONDS = 60     # length of the 1-minute promo
+PROMO_SECONDS = 30     # length of the flash promo (live countdown)
 REMINDER_EVERY = timedelta(hours=5)
 
 # --------------------------------------------------------------------------- #
@@ -41,15 +41,20 @@ WELCOME = (
 
 BLOCKAGE = "🔥 <b>FB and IG with NO CHANCE OF BLOCKAGE</b>"
 
-PROMO = (
-    "⏰ <b>1 Minute Promo</b>\n\n"
-    "Visit the website in the next minute and get an account at an "
+PROMO_HEADER = (
+    "⚡ <b>30-Second Promo</b>\n\n"
+    "Visit the website before the timer hits zero and get an account at an "
     "<b>80% discount</b>.\n\n"
+)
+
+PROMO_EXPIRED = (
+    "⌛ <b>This promo has ended.</b>\n\n"
+    "Keep an eye out — more flash deals drop regularly.\n\n"
     f'👉 <a href="{WEBSITE}">agedsocial.com</a>'
 )
 
 PROMO_OVER = (
-    "⌛ <b>The 1-minute window is closed…</b>\n\n"
+    "⌛ <b>The 30-second window is closed…</b>\n\n"
     "But you still have a chance — you can still get an account at a discount.\n\n"
     f'👉 <a href="{WEBSITE}">agedsocial.com</a>'
 )
@@ -65,6 +70,19 @@ REMINDER = (
 def website_button() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🌐 Get my account — agedsocial.com", url=WEBSITE)]]
+    )
+
+
+def promo_text(remaining: int) -> str:
+    """Promo message body with a live progress bar for the current second."""
+    elapsed = PROMO_SECONDS - remaining
+    filled = int(elapsed / PROMO_SECONDS * 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    return (
+        f"{PROMO_HEADER}"
+        f"⏳ <b>{remaining}s</b> remaining\n"
+        f"<code>{bar}</code>\n\n"
+        f'👉 <a href="{WEBSITE}">agedsocial.com</a>'
     )
 
 
@@ -92,6 +110,41 @@ def _save_subscribers() -> None:
 # --------------------------------------------------------------------------- #
 # The timed promo sequence
 # --------------------------------------------------------------------------- #
+async def _run_countdown(bot, chat_id: int, message_id: int) -> None:
+    """Edit the promo message once per second until the timer hits zero."""
+    for remaining in range(PROMO_SECONDS - 1, -1, -1):
+        await asyncio.sleep(1)
+        try:
+            await bot.edit_message_text(
+                promo_text(remaining),
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+                reply_markup=website_button(),
+            )
+        except BadRequest as exc:
+            # "message is not modified" or the user deleted the message —
+            # either way we just stop editing and carry on.
+            if "not modified" not in str(exc).lower():
+                logger.info("countdown edit skipped for %s: %s", chat_id, exc)
+                return
+        except TelegramError:
+            logger.info("countdown edit failed for %s", chat_id, exc_info=True)
+            return
+
+    # Timer finished — flip the promo message to its expired state.
+    try:
+        await bot.edit_message_text(
+            PROMO_EXPIRED,
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode="HTML",
+            reply_markup=website_button(),
+        )
+    except TelegramError:
+        logger.info("could not mark promo as expired for %s", chat_id)
+
+
 async def _promo_flow(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot = context.bot
     try:
@@ -109,14 +162,19 @@ async def _promo_flow(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
         except TelegramError:
             logger.info("welcome message for %s could not be deleted", chat_id)
 
-        # t = 10s — promo with button
+        # t = 10s — promo with live countdown + button
         await asyncio.sleep(DELETE_DELAY)
-        await bot.send_message(
-            chat_id, PROMO, parse_mode="HTML", reply_markup=website_button()
+        promo = await bot.send_message(
+            chat_id,
+            promo_text(PROMO_SECONDS),
+            parse_mode="HTML",
+            reply_markup=website_button(),
         )
 
-        # t = 70s — countdown over
-        await asyncio.sleep(PROMO_SECONDS)
+        # t = 10s → 40s — countdown ticks down each second
+        await _run_countdown(bot, chat_id, promo.message_id)
+
+        # t = 40s — the "you still have a chance" follow-up
         await bot.send_message(
             chat_id, PROMO_OVER, parse_mode="HTML", reply_markup=website_button()
         )
@@ -191,7 +249,6 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id, REMINDER, parse_mode="HTML", reply_markup=website_button()
             )
         except Forbidden:
-            # user blocked the bot / deleted the chat
             subscribers.discard(chat_id)
             _save_subscribers()
         except TelegramError:
