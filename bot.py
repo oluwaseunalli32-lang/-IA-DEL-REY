@@ -1,289 +1,74 @@
-"""IA DEL REY — Agedsocial promo bot (polling version)."""
-
-import asyncio
-import json
-import logging
 import os
-from datetime import timedelta
-from pathlib import Path
+import logging
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, Forbidden, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
-
+# Enable logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-logger = logging.getLogger("agedsocial-bot")
+logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# Config
-# --------------------------------------------------------------------------- #
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBSITE = "https://agedsocial.com"
-SUBSCRIBERS_FILE = Path("subscribers.json")
+# --- Educational Command Handlers (Keep these as they are) ---
 
-WELCOME_DELAY = 5      # wait before the "no blockage" message
-SECOND_DELAY = 2       # wait before deleting the welcome message
-DELETE_DELAY = 3       # wait before the promo message
-PROMO_SECONDS = 30     # length of the flash promo (live countdown)
-REMINDER_EVERY = timedelta(hours=5)
-
-# --------------------------------------------------------------------------- #
-# Texts (HTML so we don't have to escape MarkdownV2 punctuation)
-# --------------------------------------------------------------------------- #
-WELCOME = (
-    "Are you a working boy or a hustler looking for a confirmed US FB account "
-    "with pages or an IG account?\n\n"
-    f'Agedsocial is the right option for you 👉 <a href="{WEBSITE}">agedsocial.com</a>'
-)
-
-BLOCKAGE = "🔥 <b>FB and IG with NO CHANCE OF BLOCKAGE</b>"
-
-PROMO_HEADER = (
-    "⚡ <b>30-Second Promo</b>\n\n"
-    "Visit the website before the timer hits zero and get an account at an "
-    "<b>80% discount</b>.\n\n"
-)
-
-PROMO_EXPIRED = (
-    "⌛ <b>This promo has ended.</b>\n\n"
-    "Keep an eye out — more flash deals drop regularly.\n\n"
-    f'👉 <a href="{WEBSITE}">agedsocial.com</a>'
-)
-
-PROMO_OVER = (
-    "⌛ <b>The 30-second window is closed…</b>\n\n"
-    "But you still have a chance — you can still get an account at a discount.\n\n"
-    f'👉 <a href="{WEBSITE}">agedsocial.com</a>'
-)
-
-REMINDER = (
-    "🔔 <b>Agedsocial update</b>\n\n"
-    "Fresh US FB accounts (with pages) and IG accounts are available right now — "
-    "no chance of blockage.\n\n"
-    f'👉 <a href="{WEBSITE}">agedsocial.com</a>'
-)
-
-
-def website_button() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🌐 Get my account — agedsocial.com", url=WEBSITE)]]
-    )
-
-
-def promo_text(remaining: int) -> str:
-    """Promo message body with a live progress bar for the current second."""
-    elapsed = PROMO_SECONDS - remaining
-    filled = int(elapsed / PROMO_SECONDS * 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    return (
-        f"{PROMO_HEADER}"
-        f"⏳ <b>{remaining}s</b> remaining\n"
-        f"<code>{bar}</code>\n\n"
-        f'👉 <a href="{WEBSITE}">agedsocial.com</a>'
-    )
-
-
-# --------------------------------------------------------------------------- #
-# State (subscribers survive a restart via subscribers.json)
-# --------------------------------------------------------------------------- #
-def _load_subscribers() -> set[int]:
-    try:
-        return {int(x) for x in json.loads(SUBSCRIBERS_FILE.read_text())}
-    except Exception:
-        return set()
-
-
-subscribers: set[int] = _load_subscribers()
-flows: dict[int, asyncio.Task] = {}
-
-
-def _save_subscribers() -> None:
-    try:
-        SUBSCRIBERS_FILE.write_text(json.dumps(sorted(subscribers)))
-    except Exception:
-        logger.warning("could not persist subscribers", exc_info=True)
-
-
-# --------------------------------------------------------------------------- #
-# The timed promo sequence
-# --------------------------------------------------------------------------- #
-async def _run_countdown(bot, chat_id: int, message_id: int) -> None:
-    """Edit the promo message once per second until the timer hits zero."""
-    for remaining in range(PROMO_SECONDS - 1, -1, -1):
-        await asyncio.sleep(1)
-        try:
-            await bot.edit_message_text(
-                promo_text(remaining),
-                chat_id=chat_id,
-                message_id=message_id,
-                parse_mode="HTML",
-                reply_markup=website_button(),
-            )
-        except BadRequest as exc:
-            # "message is not modified" or the user deleted the message —
-            # either way we just stop editing and carry on.
-            if "not modified" not in str(exc).lower():
-                logger.info("countdown edit skipped for %s: %s", chat_id, exc)
-                return
-        except TelegramError:
-            logger.info("countdown edit failed for %s", chat_id, exc_info=True)
-            return
-
-    # Timer finished — flip the promo message to its expired state.
-    try:
-        await bot.edit_message_text(
-            PROMO_EXPIRED,
-            chat_id=chat_id,
-            message_id=message_id,
-            parse_mode="HTML",
-            reply_markup=website_button(),
-        )
-    except TelegramError:
-        logger.info("could not mark promo as expired for %s", chat_id)
-
-
-async def _promo_flow(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    bot = context.bot
-    try:
-        # t = 0s — welcome
-        welcome = await bot.send_message(chat_id, WELCOME, parse_mode="HTML")
-
-        # t = 5s — "no chance of blockage"
-        await asyncio.sleep(WELCOME_DELAY)
-        await bot.send_message(chat_id, BLOCKAGE, parse_mode="HTML")
-
-        # t = 7s — delete the welcome message
-        await asyncio.sleep(SECOND_DELAY)
-        try:
-            await bot.delete_message(chat_id, welcome.message_id)
-        except TelegramError:
-            logger.info("welcome message for %s could not be deleted", chat_id)
-
-        # t = 10s — promo with live countdown + button
-        await asyncio.sleep(DELETE_DELAY)
-        promo = await bot.send_message(
-            chat_id,
-            promo_text(PROMO_SECONDS),
-            parse_mode="HTML",
-            reply_markup=website_button(),
-        )
-
-        # t = 10s → 40s — countdown ticks down each second
-        await _run_countdown(bot, chat_id, promo.message_id)
-
-        # t = 40s — the "you still have a chance" follow-up
-        await bot.send_message(
-            chat_id, PROMO_OVER, parse_mode="HTML", reply_markup=website_button()
-        )
-
-    except asyncio.CancelledError:
-        logger.info("promo flow for %s cancelled (user restarted)", chat_id)
-        raise
-    except Exception:
-        logger.exception("promo flow failed for chat %s", chat_id)
-
-
-# --------------------------------------------------------------------------- #
-# Handlers
-# --------------------------------------------------------------------------- #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-
-    if chat_id not in subscribers:
-        subscribers.add(chat_id)
-        _save_subscribers()
-
-    # If they hit /start again mid-flow, kill the old sequence first.
-    previous = flows.get(chat_id)
-    if previous and not previous.done():
-        previous.cancel()
-
-    task = asyncio.create_task(_promo_flow(chat_id, context))
-
-    def _cleanup(t: asyncio.Task, cid: int = chat_id) -> None:
-        if not t.cancelled():
-            t.exception()  # mark as retrieved
-        if flows.get(cid) is t:
-            flows.pop(cid, None)
-
-    task.add_done_callback(_cleanup)
-    flows[chat_id] = task
-
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    subscribers.discard(chat_id)
-    _save_subscribers()
-
-    task = flows.pop(chat_id, None)
-    if task and not task.done():
-        task.cancel()
-
-    await update.message.reply_text(
-        "Okay, reminders stopped. Send /start anytime to begin again."
+    user = update.effective_user
+    await update.message.reply_html(
+        f"👋 Hello {user.mention_html()}!\n\n"
+        f"I am 🤖 **IA DEL REY**, your educational assistant for learning about Artificial Intelligence.\n\n"
+        f"Use /help to see available commands."
     )
 
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "/start — see the Agedsocial promo\n"
-        "/stop — stop the 5-hour reminders\n\n"
-        f"Website: {WEBSITE}"
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "📚 **Available Commands:**\n"
+        "/start - Welcome message\n"
+        "/help - Show this help message\n"
+        "/learn - Get an AI concept explained\n"
+        "/quiz - Test your knowledge with a quick question\n"
     )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
+async def learn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    fact = (
+        "💡 **AI Concept:** What is Machine Learning?\n\n"
+        "Machine Learning is a subset of AI that allows systems to learn and improve from experience without being explicitly programmed."
+    )
+    await update.message.reply_text(fact, parse_mode='Markdown')
 
-# --------------------------------------------------------------------------- #
-# 5-hour broadcast
-# --------------------------------------------------------------------------- #
-async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not subscribers:
+async def quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    question = (
+        "🧠 **Quick Quiz:**\n"
+        "What does 'AI' stand for?\n\n"
+        "A) Automated Intelligence\n"
+        "B) Artificial Intelligence\n"
+        "C) Advanced Integration\n\n"
+        "Reply with the letter of your answer."
+    )
+    await update.message.reply_text(question, parse_mode='Markdown')
+
+# --- Main Application (POLLING VERSION for Background Worker) ---
+
+def main() -> None:
+    """Start the bot in polling mode."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable not set!")
         return
 
-    logger.info("sending 5h reminder to %d subscriber(s)", len(subscribers))
-    for chat_id in list(subscribers):
-        try:
-            await context.bot.send_message(
-                chat_id, REMINDER, parse_mode="HTML", reply_markup=website_button()
-            )
-        except Forbidden:
-            subscribers.discard(chat_id)
-            _save_subscribers()
-        except TelegramError:
-            logger.warning("reminder failed for %s", chat_id, exc_info=True)
-        await asyncio.sleep(0.05)  # stay well under the 30 msg/s limit
+    # Build the application normally (polling is the default)
+    application = ApplicationBuilder().token(token).build()
 
+    # Register command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("learn", learn))
+    application.add_handler(CommandHandler("quiz", quiz))
 
-# --------------------------------------------------------------------------- #
-# Entry point
-# --------------------------------------------------------------------------- #
-def main() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
+    logger.info("Bot is starting in polling mode...")
+    # run_polling() starts the bot and keeps it running indefinitely
+    application.run_polling()
 
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    if app.job_queue is None:
-        raise SystemExit(
-            "JobQueue is unavailable — install python-telegram-bot[job-queue]"
-        )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("help", help_cmd))
-
-    app.job_queue.run_repeating(
-        send_reminders,
-        interval=REMINDER_EVERY,
-        first=REMINDER_EVERY,
-        name="agedsocial-5h-reminder",
-    )
-
-    logger.info("IA DEL REY (Agedsocial promo bot) is running…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
